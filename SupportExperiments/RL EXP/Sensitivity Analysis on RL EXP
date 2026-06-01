@@ -1,0 +1,75 @@
+!pip install stable-baselines3
+!pip install gymnasium[box2d]
+!pip install shimmy>=0.2.1
+
+import numpy as np
+import torch
+import gymnasium as gym # Changed from gym to gymnasium
+from stable_baselines3 import PPO
+from sklearn.feature_selection import mutual_info_regression
+
+# ── 1. Discrete Conditional MI Helper ──
+def compute_conditional_mi_discrete(X, Y, D):
+    """Computes I(X; Y | D) using binning, adapted for any proxy D."""
+    def bin_data(data):
+        # Handle cases where data is multi-dimensional or continuous
+        if data.ndim > 1: data = data[:, 0] # This line only takes the first dimension for binning if multi-dim
+        return np.digitize(data, bins=np.linspace(data.min(), data.max(), 5))
+
+    X_b, Y_b = bin_data(X), bin_data(Y)
+
+    # Calculate I(X; Y | D) for each unique proxy level in D
+    mi_vals = []
+    unique_d = np.unique(D)
+    for d_val in unique_d:
+        mask = (D == d_val)
+        if np.sum(mask) > 10:
+            mi_vals.append(mutual_info_regression(X_b[mask].reshape(-1,1), Y_b[mask], random_state=42)[0])
+    return np.mean(mi_vals) if mi_vals else 0
+
+# ── 2. Sensitivity Analysis Loop ──
+def run_sensitivity_analysis():
+    env = gym.make("LunarLander-v3") # Changed to LunarLander-v3
+    model = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=5000)
+
+    obs, _ = env.reset() # Unpack the tuple (observation, info)
+    states, next_states = [], []
+    rewards, actions, state_visits = [], [], []
+
+    # Collect 2000 transition samples
+    for _ in range(2000):
+        action, _ = model.predict(obs)
+        next_obs, reward, terminated, truncated, _ = env.step(action) # Unpack (observation, reward, terminated, truncated, info)
+        done = terminated or truncated # Handle combined done condition
+
+        # Policy Latent Space
+        # h_prev and h_next are 1D arrays of shape (hidden_dim,)
+        h_prev = model.policy.mlp_extractor.policy_net(torch.FloatTensor(obs)).detach().numpy()
+        h_next = model.policy.mlp_extractor.policy_net(torch.FloatTensor(next_obs)).detach().numpy()
+
+        # Append the entire hidden state vector, not just the first element
+        states.append(h_prev); next_states.append(h_next)
+        rewards.append(reward)
+        actions.append(action)
+        state_visits.append(np.linalg.norm(obs)) # Proxy for visitation frequency
+
+        obs = next_obs if not done else env.reset()[0] # Reset returns (observation, info), so take [0]
+
+    # Convert to arrays - S and S_next will now be 2D arrays (num_samples, hidden_dim)
+    S, S_next = np.array(states), np.array(next_states)
+
+    # Calculate I_int (Unconditional) - S[:, 0:1] keeps it 2D (num_samples, 1)
+    i_int = mutual_info_regression(S[:, 0:1], S_next[:, 0], random_state=42)[0]
+
+    # Sensitivity Analysis: MI_cond for different D proxies
+    proxies = {"Rewards": np.array(rewards), "Actions": np.array(actions), "StateVisits": np.array(state_visits)}
+
+    print(f"{'Proxy (D)':<15} | {'MI_cond':<10}")
+    print("-" * 30)
+    for name, D in proxies.items():
+        i_int_c = compute_conditional_mi_discrete(S[:, 0], S_next[:, 0], D) # Pass 1D arrays for X and Y to conditional MI
+        i_ext = mutual_info_regression(S[:, 0:1], D, random_state=42)[0]
+        mi_cond = i_int_c / (i_int_c + i_ext) # Corrected calculation using i_int_c
+        print(f"{name:<15} | {mi_cond:.4f}")
+
+run_sensitivity_analysis()
