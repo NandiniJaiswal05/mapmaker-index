@@ -1,0 +1,52 @@
+!pip install stable-baselines3
+!pip install gymnasium[box2d]
+
+import numpy as np
+import gymnasium as gym 
+from stable_baselines3 import PPO
+from sklearn.feature_selection import mutual_info_regression
+import torch
+
+# ── 1. Conditional MI Helper (Same logic as MLP) ──
+def compute_conditional_mi_discrete(X, Y, D):
+    """Computes I(X; Y | D) for PPO agent conditioned on Rewards."""
+    def bin_data(data):
+        return np.digitize(data, bins=np.linspace(data.min(), data.max(), 5))
+    X_b, Y_b = bin_data(X), bin_data(Y)
+
+    # Condition on reward levels
+    mi_vals = []
+    for r_level in np.unique(D):
+        mask = (D == r_level)
+        if np.sum(mask) > 10:
+            mi_vals.append(mutual_info_regression(X_b[mask].reshape(-1,1), Y_b[mask], random_state=42)[0])
+    return np.mean(mi_vals) if mi_vals else 0
+
+# ── 2. PPO Evaluation Loop ──
+def run_ppo_analysis():
+    env = gym.make("LunarLander-v3") # Changed to LunarLander-v3
+    model = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=10000)
+
+    obs, _ = env.reset() # Unpack the tuple (observation, info)
+    states, next_states, rewards = [], [], []
+
+    # Collect transition data
+    for _ in range(2000):
+        action, _ = model.predict(obs)
+        next_obs, reward, terminated, truncated, _ = env.step(action) 
+
+        h_prev = model.policy.mlp_extractor.policy_net(torch.FloatTensor(obs)).detach().numpy()
+        h_next = model.policy.mlp_extractor.policy_net(torch.FloatTensor(next_obs)).detach().numpy()
+
+        states.append(h_prev[0]); next_states.append(h_next[0]); rewards.append(reward)
+        obs = next_obs if not (terminated or truncated) else env.reset()[0] 
+
+    # Calculate Metrics
+    i_int = mutual_info_regression(np.array(states).reshape(-1,1), np.array(next_states))[0]
+    i_ext = mutual_info_regression(np.array(states).reshape(-1,1), np.array(rewards))[0]
+
+    i_int_c = compute_conditional_mi_discrete(np.array(states), np.array(next_states), np.array(rewards))
+
+    print(f"PPO Analysis -> Uncond MI: {i_int/(i_int+i_ext):.4f} | Cond MI: {i_int_c/(i_int_c+i_ext):.4f}")
+
+run_ppo_analysis()
