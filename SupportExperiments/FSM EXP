@@ -1,0 +1,75 @@
+import numpy as np
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.linear_model import LinearRegression
+
+# ── FSM definition ──
+STATES = [0, 1, 2, 3]
+INPUTS = [0, 1, 2]
+TRANSITION = {0:{0:1, 1:0, 2:0}, 1:{0:2, 1:0, 2:2}, 2:{0:3, 1:0, 2:3}, 3:{0:0, 1:0, 2:0}}
+RULE_ENCODING = {(s,i): s*len(INPUTS)+i for s in STATES for i in INPUTS}
+
+def run_fsm(T=5000, seed=42):
+    np.random.seed(seed)
+    state = 0
+    states, next_states, rule_ids = [], [], []
+    for _ in range(T):
+        inp = np.random.choice(INPUTS, p=[0.80, 0.05, 0.15])
+        ns = TRANSITION[state][inp]
+        states.append(state)
+        next_states.append(ns)
+        rule_ids.append(RULE_ENCODING[(state, inp)])
+        state = ns
+    return np.array(states), np.array(next_states), np.array(rule_ids)
+
+# ── Conditional MI via Residual Approach ──
+def mi(X, Y, seed=42):
+    """Unconditional MI: I(X ; Y)"""
+    return max(mutual_info_regression(X.reshape(-1,1).astype(float), Y.astype(float),
+                                      random_state=seed)[0], 1e-10)
+
+def conditional_mi(states, next_states, rule_ids):
+    """
+    Computes I(St; St+1 | D) using discrete counts (Shannon Entropy).
+    This is the mathematically correct way to handle FSMs.
+    """
+    import pandas as pd
+
+    # Create a dataframe for easy grouping
+    df = pd.DataFrame({'St': states, 'St1': next_states, 'D': rule_ids})
+
+    def shannon_entropy(series):
+        counts = series.value_counts(normalize=True)
+        return -np.sum(counts * np.log2(counts + 1e-10))
+
+    # Calculate H(St|D) and H(St|St+1, D)
+    # CMI = H(St|D) - H(St|St+1, D)
+    h_st_d = 0
+    h_st_st1_d = 0
+
+    for d in df['D'].unique():
+        subset = df[df['D'] == d]
+        p_d = len(subset) / len(df)
+
+        # Entropy of St given this specific rule D
+        h_st_d += p_d * shannon_entropy(subset['St'])
+
+        # Conditional entropy of St given St+1 and D
+        # In a deterministic FSM, this should be 0
+        h_st_st1_d += p_d * shannon_entropy(subset.groupby('St1')['St'])
+
+    cmi = max(h_st_d - h_st_st1_d, 0)
+    return cmi
+
+# ── Run Experiment ──────────────────────────────────────────────────────────
+states, next_states, rule_ids = run_fsm(T=5000)
+
+i_int = mi(states, next_states)
+i_ext = mi(states, rule_ids)
+mi_uncond = i_int / (i_int + i_ext)
+
+i_int_c = conditional_mi(states, next_states, rule_ids)
+mi_cond = i_int_c / (i_int_c + i_ext)
+
+print(f"Unconditional MI: {mi_uncond:.4f}")
+print(f"Conditional MI  : {mi_cond:.4f}")
+print(f"Classification  : {'Computational' if mi_cond < 0.10 else 'Adaptive/Mapmaker'}")
