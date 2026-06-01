@@ -1,0 +1,92 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.decomposition import PCA
+
+# ── Config ──
+SEED = 1024
+np.random.seed(SEED); torch.manual_seed(SEED)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE, EPOCHS, N_SAMPLES, PCA_DIM = 256, 10, 1000, 5
+
+# ── 1. Helpers (Your original code + Conditional MI) ──
+def compute_mi_arrays(X, Y):
+    X = X.reshape(-1, 1).astype(float)
+    Y = Y.astype(float)
+    return max(mutual_info_regression(X, Y, random_state=SEED)[0], 1e-10)
+
+def compute_conditional_mi_discrete(X, Y, D):
+    """I(X; Y | D) via mean MI per label group."""
+    # Binning to discrete levels
+    def bin_data(data):
+        return np.digitize(data, bins=np.linspace(data.min(), data.max(), 5))
+    X_b, Y_b = bin_data(X), bin_data(Y)
+
+    mi_vals = []
+    for label in np.unique(D):
+        mask = (D == label)
+        if np.sum(mask) > 10:
+            mi_vals.append(mutual_info_regression(X_b[mask].reshape(-1,1), Y_b[mask], random_state=SEED)[0])
+    return np.mean(mi_vals) if mi_vals else 0
+
+def extract_hidden_states(model, loader, n_samples=N_SAMPLES):
+    model.eval()
+    hiddens, labels_list = [], []
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.view(x.size(0), -1).to(DEVICE)
+            _, h = model(x)
+            hiddens.append(h.cpu().numpy()); labels_list.append(y.numpy())
+            if len(np.concatenate(hiddens)) >= n_samples: break
+    return np.concatenate(hiddens)[:n_samples], np.concatenate(labels_list)[:n_samples]
+
+def reduce_dim(h, pca=None, fit=False):
+    if fit or pca is None:
+        pca = PCA(n_components=PCA_DIM, random_state=SEED)
+        h_red = pca.fit_transform(h)
+    else: h_red = pca.transform(h)
+    return h_red, pca
+
+# ── 2. Model & Data ──
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(784, 256); self.fc2 = nn.Linear(256, 128); self.fc3 = nn.Linear(128, 10)
+    def forward(self, x):
+        h1 = torch.relu(self.fc1(x)); h2 = torch.relu(self.fc2(h1)); return self.fc3(h2), h2
+
+train_loader = DataLoader(datasets.MNIST('./data', train=True, download=True, transform=transforms.ToTensor()), batch_size=BATCH_SIZE, shuffle=True)
+model = MLP().to(DEVICE); optimizer = optim.Adam(model.parameters(), lr=0.001); criterion = nn.CrossEntropyLoss()
+
+# ── 3. Training Loop with Conditional MI ──
+prev_hidden, prev_pca = None, None
+history = {"mi_uncond": [], "mi_cond": []}
+
+for epoch in range(1, EPOCHS + 1):
+    model.train()
+    for x, y in train_loader:
+        x, y = x.view(x.size(0), -1).to(DEVICE), y.to(DEVICE)
+        optimizer.zero_grad(); logits, _ = model(x); criterion(logits, y).backward(); optimizer.step()
+
+    curr_hidden, labels = extract_hidden_states(model, train_loader)
+    curr_red, pca_model = reduce_dim(curr_hidden, pca=prev_pca, fit=(prev_pca is None))
+
+    if prev_hidden is not None:
+        prev_red, _ = reduce_dim(prev_hidden, pca=pca_model)
+        i_int = compute_mi_arrays(prev_red[:, 0], curr_red[:, 0])
+        i_ext = compute_mi_arrays(curr_red[:, 0], labels.astype(float))
+        i_int_cond = compute_conditional_mi_discrete(prev_red[:, 0], curr_red[:, 0], labels)
+
+        mi_uncond = i_int / (i_int + i_ext)
+        mi_cond = i_int_cond / (i_int_cond + i_ext)
+        history["mi_uncond"].append(mi_uncond)
+        history["mi_cond"].append(mi_cond)
+        print(f"Epoch {epoch} | Uncond: {mi_uncond:.4f} | Cond: {mi_cond:.4f}")
+
+    prev_hidden, prev_pca = curr_hidden, pca_model
+
+print(f"\nFinal Avg -> Uncond: {np.mean(history['mi_uncond']):.4f} | Cond: {np.mean(history['mi_cond']):.4f}")
