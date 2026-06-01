@@ -1,0 +1,57 @@
+import numpy as np
+import torch
+import gymnasium as gym
+from stable_baselines3 import PPO
+from sklearn.feature_selection import mutual_info_regression
+
+def run_sensitivity_sweep():
+    env = gym.make("LunarLander-v3")
+    model = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=10000)
+
+    # Noise levels to inject into the reward signal
+    noise_levels = [0.0, 0.5, 1.0, 2.0, 5.0, 10.0]
+
+    results = {}
+
+    for noise in noise_levels:
+        obs, _ = env.reset()
+        states, next_states, rewards = [], [], []
+
+        for _ in range(1000):
+            action, _ = model.predict(obs)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+
+            # Inject noise into the reward (the extrinsic constraint D)
+            noisy_reward = reward + np.random.normal(0, noise)
+
+            h_prev = model.policy.mlp_extractor.policy_net(torch.FloatTensor(obs)).detach().numpy()
+            h_next = model.policy.mlp_extractor.policy_net(torch.FloatTensor(next_obs)).detach().numpy()
+
+            states.append(h_prev[0]); next_states.append(h_next[0]); rewards.append(noisy_reward)
+            obs = next_obs if not (terminated or truncated) else env.reset()[0]
+
+        # Calculate MI_cond with the noisy reward signal
+        S, Sn, R = np.array(states), np.array(next_states), np.array(rewards)
+        i_int_c = compute_mi_for_sweep(S, Sn, R) # Uses your established discrete MI logic
+        i_ext = mutual_info_regression(S.reshape(-1,1), R, random_state=42)[0]
+        results[noise] = i_int_c / (i_int_c + i_ext)
+
+    return results
+
+def compute_mi_for_sweep(X, Y, D):
+    """Helper: Discrete MI calculation."""
+    def bin_data(data): return np.digitize(data, bins=np.linspace(data.min(), data.max(), 5))
+    X_b, Y_b = bin_data(X), bin_data(Y)
+
+    mi_vals = []
+    for d_val in np.unique(np.digitize(D, bins=np.linspace(D.min(), D.max(), 5))):
+        mask = (np.digitize(D, bins=np.linspace(D.min(), D.max(), 5)) == d_val)
+        if np.sum(mask) > 10:
+            mi_vals.append(mutual_info_regression(X_b[mask].reshape(-1,1), Y_b[mask], random_state=42)[0])
+    return np.mean(mi_vals) if mi_vals else 0
+
+# ── Execute & Visualize ──
+sweep_results = run_sensitivity_sweep()
+print("Noise Level | Mapmaker Index (MI_cond)")
+for n, val in sweep_results.items():
+    print(f"{n:<11} | {val:.4f}")
